@@ -110,6 +110,11 @@ app.post('/api/subscribe', async (req, res) => {
   }
 });
 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
