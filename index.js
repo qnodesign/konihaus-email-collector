@@ -77,6 +77,9 @@ app.post('/api/subscribe', async (req, res) => {
       });
     }
 
+    // Get client IP (handle Vercel proxy)
+    const clientIp = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : req.ip;
+
     // Get existing emails
     const emails = await getEmailsFromS3();
 
@@ -88,9 +91,19 @@ app.post('/api/subscribe', async (req, res) => {
       });
     }
 
-    // Add new email with timestamp
+    // Check IP limit (max 3 emails per IP)
+    const emailsFromIp = emails.filter(entry => entry.ipAddress === clientIp).length;
+    if (emailsFromIp >= 3) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many signups from this IP address'
+      });
+    }
+
+    // Add new email with timestamp and IP
     emails.push({
       email: trimmedEmail,
+      ipAddress: clientIp,
       subscribedAt: new Date().toISOString()
     });
 
