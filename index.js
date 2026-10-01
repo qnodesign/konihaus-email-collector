@@ -22,6 +22,7 @@ const s3 = new S3Client({
 const BUCKET_NAME = process.env.S3_BUCKET_NAME || 'email-collector-bucket';
 const FILE_KEY = 'emails.json';            // landing page signups
 const BLOG_FILE_KEY = 'blog-emails.json';  // blog newsletter signups
+const CODES_FILE_KEY = 'codes.json';       // qr key -> promo code (private, never shipped with the website)
 const SUPPORTED_LANGS = ['de', 'en'];
 const DEFAULT_LANG = 'de';
 
@@ -149,6 +150,58 @@ app.post('/api/subscribe', createSubscribeHandler({ fileKey: FILE_KEY, withLangu
 
 // Blog newsletter signup -> blog-emails.json (with language preference)
 app.post('/api/blog-subscribe', createSubscribeHandler({ fileKey: BLOG_FILE_KEY, withLanguage: true }));
+
+// ---- Promo codes: GET /api/getcode?str=<qr-key> -> { success: true, code } -------------
+// codes.json lives in S3, not in the website. Only an exact key match returns a code;
+// anything else gets a bare 404 so the page can simply ignore the qr value.
+const CODES_CACHE_MS = 5 * 60 * 1000; // edits to codes.json show up within 5 minutes
+let codesCache = { data: null, at: 0 };
+
+async function getCodes() {
+  if (codesCache.data && Date.now() - codesCache.at < CODES_CACHE_MS) return codesCache.data;
+  let data = {};
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: CODES_FILE_KEY }));
+    const parsed = JSON.parse(await out.Body.transformToString());
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+  } catch (error) {
+    if (error.name !== 'NoSuchKey') throw error;
+  }
+  codesCache = { data, at: Date.now() };
+  return data;
+}
+
+// Best-effort rate limit per IP (in memory, so per serverless instance) to slow down key guessing
+const codeHits = new Map();
+function codeRateLimited(ip) {
+  const now = Date.now();
+  const recent = (codeHits.get(ip) || []).filter(t => now - t < 60 * 1000);
+  recent.push(now);
+  codeHits.set(ip, recent);
+  if (codeHits.size > 5000) codeHits.clear();
+  return recent.length > 30;
+}
+
+app.get('/api/getcode', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (codeRateLimited(getClientIp(req))) {
+      return res.status(429).json({ success: false });
+    }
+    const str = typeof req.query.str === 'string' ? req.query.str.trim().toLowerCase() : '';
+    if (!/^[a-z0-9-]{1,80}$/.test(str)) {
+      return res.status(404).json({ success: false });
+    }
+    const codes = await getCodes();
+    if (!Object.hasOwn(codes, str) || typeof codes[str] !== 'string') {
+      return res.status(404).json({ success: false });
+    }
+    res.status(200).json({ success: true, code: codes[str] });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
 
 // Root endpoint
 app.get('/', (req, res) => {
