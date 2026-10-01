@@ -23,6 +23,7 @@ const BUCKET_NAME = process.env.S3_BUCKET_NAME || 'email-collector-bucket';
 const FILE_KEY = 'emails.json';            // landing page signups
 const BLOG_FILE_KEY = 'blog-emails.json';  // blog newsletter signups
 const CODES_FILE_KEY = 'codes.json';       // qr key -> promo code (private, never shipped with the website)
+const CODE_USAGES_FILE_KEY = 'code-usages.json'; // one entry per page load with a valid qr key (conversion monitoring)
 const SUPPORTED_LANGS = ['de', 'en'];
 const DEFAULT_LANG = 'de';
 
@@ -182,6 +183,44 @@ function codeRateLimited(ip) {
   return recent.length > 30;
 }
 
+// Appends { ip, time, code } to code-usages.json. Uses S3 conditional writes (ETag) with a few retries so two
+// simultaneous visitors don't overwrite each other's entry. Never throws and never overwrites a file it can't
+// read as a JSON array: tracking must not break the page.
+async function logCodeUsage(entry) {
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      let list = [];
+      let etag;
+      try {
+        const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: CODE_USAGES_FILE_KEY }));
+        list = JSON.parse(await out.Body.transformToString());
+        etag = out.ETag;
+      } catch (error) {
+        if (error.name !== 'NoSuchKey') throw error;
+      }
+      if (!Array.isArray(list)) throw new Error(`${CODE_USAGES_FILE_KEY} is not a JSON array`);
+      list.push(entry);
+      await s3.send(new PutObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: CODE_USAGES_FILE_KEY,
+        Body: JSON.stringify(list, null, 2),
+        ContentType: 'application/json',
+        ...(etag ? { IfMatch: etag } : { IfNoneMatch: '*' })
+      }));
+      return;
+    } catch (error) {
+      const status = error.$metadata && error.$metadata.httpStatusCode;
+      const conflict = error.name === 'PreconditionFailed' || error.name === 'ConditionalRequestConflict' || status === 412 || status === 409;
+      if (!conflict || attempt === MAX_ATTEMPTS) {
+        console.error('Code usage log failed:', error);
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 20 + Math.random() * 100)); // someone else wrote first: retry
+    }
+  }
+}
+
 app.get('/api/getcode', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
@@ -196,6 +235,8 @@ app.get('/api/getcode', async (req, res) => {
     if (!Object.hasOwn(codes, str) || typeof codes[str] !== 'string') {
       return res.status(200).json({ success: false });
     }
+    // Valid key: record the visit (awaited, because Vercel freezes the function once the response is sent)
+    await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str });
     res.status(200).json({ success: true, code: codes[str] });
   } catch (error) {
     console.error('Error:', error);
