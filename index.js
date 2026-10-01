@@ -145,7 +145,7 @@ function createSubscribeHandler({ fileKey, withLanguage }) {
 }
 
 // Landing page signup -> emails.json (unchanged behaviour)
-app.post('/api/subscribe', createSubscribeHandler({ fileKey: FILE_KEY, withLanguage: false }));
+app.post('/api/subscribe', createSubscribeHandler({ fileKey: FILE_KEY, withLanguage: true }));
 
 // Blog newsletter signup -> blog-emails.json (with language preference)
 app.post('/api/blog-subscribe', createSubscribeHandler({ fileKey: BLOG_FILE_KEY, withLanguage: true }));
