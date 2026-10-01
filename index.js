@@ -153,7 +153,7 @@ app.post('/api/blog-subscribe', createSubscribeHandler({ fileKey: BLOG_FILE_KEY,
 
 // ---- Promo codes: GET /api/getcode?str=<qr-key> -> { success: true, code } -------------
 // codes.json lives in S3, not in the website. Only an exact key match returns a code;
-// anything else gets a bare 404 so the page can simply ignore the qr value.
+// anything else gets { success: false } with HTTP 200 (a 404 would be logged as an error in the browser console).
 const CODES_CACHE_MS = 5 * 60 * 1000; // edits to codes.json show up within 5 minutes
 let codesCache = { data: null, at: 0 };
 
@@ -190,11 +190,11 @@ app.get('/api/getcode', async (req, res) => {
     }
     const str = typeof req.query.str === 'string' ? req.query.str.trim().toLowerCase() : '';
     if (!/^[a-z0-9-]{1,80}$/.test(str)) {
-      return res.status(404).json({ success: false });
+      return res.status(200).json({ success: false });
     }
     const codes = await getCodes();
     if (!Object.hasOwn(codes, str) || typeof codes[str] !== 'string') {
-      return res.status(404).json({ success: false });
+      return res.status(200).json({ success: false });
     }
     res.status(200).json({ success: true, code: codes[str] });
   } catch (error) {
