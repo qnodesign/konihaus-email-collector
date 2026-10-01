@@ -24,6 +24,9 @@ const FILE_KEY = 'emails.json';            // landing page signups
 const BLOG_FILE_KEY = 'blog-emails.json';  // blog newsletter signups
 const CODES_FILE_KEY = 'codes.json';       // qr key -> promo code (private, never shipped with the website)
 const CODE_USAGES_FILE_KEY = 'code-usages.json'; // one entry per page load with a valid qr key (conversion monitoring)
+// Usage is only logged for visits coming from these hosts (so localhost / dev testing is not counted)
+const CODE_LOG_HOSTS = (process.env.CODE_LOG_HOSTS || 'konihaus.ch,www.konihaus.ch')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const SUPPORTED_LANGS = ['de', 'en'];
 const DEFAULT_LANG = 'de';
 
@@ -221,6 +224,19 @@ async function logCodeUsage(entry) {
   }
 }
 
+// True when the browser says the request comes from the live website (Origin header, Referer as fallback).
+// Exact host match over https only. This filters dev noise; it is not a security check (headers can be faked).
+function isLoggableOrigin(req) {
+  const source = req.headers.origin || req.headers.referer;
+  if (!source) return false;
+  try {
+    const url = new URL(source);
+    return url.protocol === 'https:' && CODE_LOG_HOSTS.includes(url.hostname.toLowerCase());
+  } catch (error) {
+    return false;
+  }
+}
+
 app.get('/api/getcode', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
@@ -235,8 +251,11 @@ app.get('/api/getcode', async (req, res) => {
     if (!Object.hasOwn(codes, str) || typeof codes[str] !== 'string') {
       return res.status(200).json({ success: false });
     }
-    // Valid key: record the visit (awaited, because Vercel freezes the function once the response is sent)
-    await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str });
+    // Valid key: record the visit, but only if it comes from konihaus.ch (awaited, because Vercel freezes the
+    // function once the response is sent). The code itself is returned to every caller, so localhost testing works.
+    if (isLoggableOrigin(req)) {
+      await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str });
+    }
     res.status(200).json({ success: true, code: codes[str] });
   } catch (error) {
     console.error('Error:', error);
