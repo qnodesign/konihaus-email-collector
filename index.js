@@ -186,7 +186,7 @@ function codeRateLimited(ip) {
   return recent.length > 30;
 }
 
-// Appends { ip, time, code } to code-usages.json. Uses S3 conditional writes (ETag) with a few retries so two
+// Appends { ip, time, code, side? } to code-usages.json. Uses S3 conditional writes (ETag) with a few retries so two
 // simultaneous visitors don't overwrite each other's entry. Never throws and never overwrites a file it can't
 // read as a JSON array: tracking must not break the page.
 async function logCodeUsage(entry) {
@@ -254,7 +254,10 @@ app.get('/api/getcode', async (req, res) => {
     // Valid key: record the visit, but only if it comes from konihaus.ch (awaited, because Vercel freezes the
     // function once the response is sent). The code itself is returned to every caller, so localhost testing works.
     if (isLoggableOrigin(req)) {
-      await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str });
+      // Which side of the card/flyer was scanned (?side=front|back). Anything else is dropped, never stored.
+      const sideRaw = typeof req.query.side === 'string' ? req.query.side.trim().toLowerCase() : '';
+      const side = sideRaw === 'front' || sideRaw === 'back' ? sideRaw : undefined;
+      await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str, ...(side ? { side } : {}) });
     }
     res.status(200).json({ success: true, code: codes[str] });
   } catch (error) {
