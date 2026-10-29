@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -24,9 +25,14 @@ const FILE_KEY = 'emails.json';            // landing page signups
 const BLOG_FILE_KEY = 'blog-emails.json';  // blog newsletter signups
 const CODES_FILE_KEY = 'codes.json';       // qr key -> promo code (private, never shipped with the website)
 const CODE_USAGES_FILE_KEY = 'code-usages.json'; // one entry per page load with a valid qr key (conversion monitoring)
+const CLICKS_FILE_KEY = 'newsletter-clicks.json'; // one entry per newsletter click that lands on a blog post (created on the first click)
 // Usage is only logged for visits coming from these hosts (so localhost / dev testing is not counted)
 const CODE_LOG_HOSTS = (process.env.CODE_LOG_HOSTS || 'konihaus.ch,www.konihaus.ch')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+// Newsletter clicks are only logged for visits coming from the blog
+const CLICK_LOG_HOSTS = (process.env.CLICK_LOG_HOSTS || 'blog.konihaus.ch')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const CLICK_SALT = process.env.CLICK_SALT || 'konihaus-newsletter-clicks'; // salt for the anonymous visitor hash
 const SUPPORTED_LANGS = ['de', 'en'];
 const DEFAULT_LANG = 'de';
 
@@ -186,27 +192,27 @@ function codeRateLimited(ip) {
   return recent.length > 30;
 }
 
-// Appends { ip, time, code, side? } to code-usages.json. Uses S3 conditional writes (ETag) with a few retries so two
+// Appends an entry to a JSON array in S3 (code-usages.json, newsletter-clicks.json). Uses S3 conditional writes (ETag) with a few retries so two
 // simultaneous visitors don't overwrite each other's entry. Never throws and never overwrites a file it can't
 // read as a JSON array: tracking must not break the page.
-async function logCodeUsage(entry) {
+async function appendToLog(key, entry) {
   const MAX_ATTEMPTS = 5;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       let list = [];
       let etag;
       try {
-        const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: CODE_USAGES_FILE_KEY }));
+        const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
         list = JSON.parse(await out.Body.transformToString());
         etag = out.ETag;
       } catch (error) {
         if (error.name !== 'NoSuchKey') throw error;
       }
-      if (!Array.isArray(list)) throw new Error(`${CODE_USAGES_FILE_KEY} is not a JSON array`);
+      if (!Array.isArray(list)) throw new Error(`${key} is not a JSON array`);
       list.push(entry);
       await s3.send(new PutObjectCommand({
         Bucket: BUCKET_NAME,
-        Key: CODE_USAGES_FILE_KEY,
+        Key: key,
         Body: JSON.stringify(list, null, 2),
         ContentType: 'application/json',
         ...(etag ? { IfMatch: etag } : { IfNoneMatch: '*' })
@@ -216,7 +222,7 @@ async function logCodeUsage(entry) {
       const status = error.$metadata && error.$metadata.httpStatusCode;
       const conflict = error.name === 'PreconditionFailed' || error.name === 'ConditionalRequestConflict' || status === 412 || status === 409;
       if (!conflict || attempt === MAX_ATTEMPTS) {
-        console.error('Code usage log failed:', error);
+        console.error(`Log append failed (${key}):`, error);
         return;
       }
       await new Promise(resolve => setTimeout(resolve, 20 + Math.random() * 100)); // someone else wrote first: retry
@@ -226,12 +232,12 @@ async function logCodeUsage(entry) {
 
 // True when the browser says the request comes from the live website (Origin header, Referer as fallback).
 // Exact host match over https only. This filters dev noise; it is not a security check (headers can be faked).
-function isLoggableOrigin(req) {
+function isLoggableOrigin(req, hosts = CODE_LOG_HOSTS) {
   const source = req.headers.origin || req.headers.referer;
   if (!source) return false;
   try {
     const url = new URL(source);
-    return url.protocol === 'https:' && CODE_LOG_HOSTS.includes(url.hostname.toLowerCase());
+    return url.protocol === 'https:' && hosts.includes(url.hostname.toLowerCase());
   } catch (error) {
     return false;
   }
@@ -257,9 +263,57 @@ app.get('/api/getcode', async (req, res) => {
       // Which side of the card/flyer was scanned (?side=front|back). Anything else is dropped, never stored.
       const sideRaw = typeof req.query.side === 'string' ? req.query.side.trim().toLowerCase() : '';
       const side = sideRaw === 'front' || sideRaw === 'back' ? sideRaw : undefined;
-      await logCodeUsage({ ip: getClientIp(req), time: new Date().toISOString(), code: str, ...(side ? { side } : {}) });
+      await appendToLog(CODE_USAGES_FILE_KEY, { ip: getClientIp(req), time: new Date().toISOString(), code: str, ...(side ? { side } : {}) });
     }
     res.status(200).json({ success: true, code: codes[str] });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ---- Newsletter clicks: POST /api/newsletter-click ------------------------------------------------
+// The blog calls this once per visit that arrives with ?utm_source=newsletter&utm_medium=email&utm_campaign=...
+// Body: { source, medium, campaign, content?, language?, path? }.
+// Stored in newsletter-clicks.json as { time, campaign, source, medium, content?, language, path?, visitor, device }.
+// No raw IP is stored: `visitor` is a short salted hash of IP + browser, enough to count unique visitors.
+function cleanSlug(value, max) {
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim().toLowerCase();
+  return new RegExp(`^[a-z0-9][a-z0-9_-]{0,${max - 1}}$`).test(v) ? v : undefined;
+}
+
+app.post('/api/newsletter-click', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const ip = getClientIp(req);
+    if (codeRateLimited(ip)) return res.status(429).json({ success: false });
+    const body = req.body || {};
+    const source = cleanSlug(body.source, 30);
+    const medium = cleanSlug(body.medium, 30);
+    const campaign = cleanSlug(body.campaign, 80);
+    const content = cleanSlug(body.content, 50);
+    if (source !== 'newsletter' || medium !== 'email' || !campaign) {
+      return res.status(200).json({ success: false });
+    }
+    // Only real blog visits are counted (localhost / dev testing is not). Same idea as the code log: not a security check.
+    if (!isLoggableOrigin(req, CLICK_LOG_HOSTS)) {
+      return res.status(200).json({ success: true, logged: false });
+    }
+    const ua = String(req.headers['user-agent'] || '');
+    const path = typeof body.path === 'string' && /^\/[a-z0-9\-\/]{0,200}$/i.test(body.path) ? body.path.toLowerCase() : undefined;
+    await appendToLog(CLICKS_FILE_KEY, {
+      time: new Date().toISOString(),
+      campaign,
+      source,
+      medium,
+      ...(content ? { content } : {}),
+      language: normalizeLanguage(body.language),
+      ...(path ? { path } : {}),
+      visitor: crypto.createHash('sha256').update(`${ip}|${ua}|${CLICK_SALT}`).digest('hex').slice(0, 16),
+      device: /mobi|iphone|android/i.test(ua) ? 'mobile' : 'desktop'
+    });
+    res.status(200).json({ success: true, logged: true });
   } catch (error) {
     console.error('Error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
